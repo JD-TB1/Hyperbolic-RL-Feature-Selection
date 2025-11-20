@@ -1,0 +1,19 @@
+# Data
+data/raw/
+data/processed/
+
+# Results
+results/checkpoints/
+results/logs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Large files
+*.pt
+*.pkl
+*.npy
+
+# System files
+.DS_Store
