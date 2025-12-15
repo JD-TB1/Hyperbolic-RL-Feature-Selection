@@ -1,6 +1,6 @@
 import random
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Callable, List, Tuple, Optional
 
 import numpy as np
@@ -12,6 +12,8 @@ from torch.optim import Adam
 import time
 import os
 
+import json
+
 @dataclass
 class FSConfig:
     n_feat: int
@@ -19,19 +21,19 @@ class FSConfig:
     lam: float = 0.0 # feature-count penalty in terminal reward
     gamma: float = 1.0 # episodic tasks typically use gamma=1.0
     eps_start: float = 1.0
-    eps_end: float = 0.1
-    eps_decay: int = 10_000 # steps for epsilon exponential decay
+    eps_end: float = 0.05
+    eps_decay: int = 50_000 # steps for epsilon exponential decay
     lr: float = 1e-3
     batch_size: int = 128
-    buffer_size: int = 100_000
+    buffer_size: int = 50_000
     target_tau: float = 0.005 # hard update when 1.0; else soft update (Polyak)
     target_update_every: int = 1000 # steps between hard updates if tau==1
-    train_start: int = 1000 # fill buffer before training
+    train_start: int = 5_000 # fill buffer before training
     train_freq: int = 1
     hidden: int = 512
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    checkpoint_save_freq: int = 1000  # episodes between saving model checkpoints
-    evaluate_freq: int = 10  # episodes between evaluations
+    checkpoint_save_freq: int = 5000  # episodes between saving model checkpoints
+    evaluate_freq: int = 50  # episodes between evaluations
     
 # ==========================================
 class FeatureSelectionEnv:
@@ -123,27 +125,28 @@ class FeatureSelectionEnv:
 class ReplayBuffer:
     def __init__(self, obs_dim: int, n_actions: int, capacity: int, device: torch.device):
         self.capacity = capacity
+        self.storage_device = torch.device("cpu")
         self.device = device
         self.ptr = 0
         self.full = False
 
 
-        self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32).to(self.device)
-        self.actions = torch.zeros((capacity, 1), dtype=torch.int64).to(self.device)
-        self.rewards = torch.zeros((capacity, 1), dtype=torch.float32).to(self.device)
-        self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32).to(self.device)
-        self.dones = torch.zeros((capacity, 1), dtype=torch.float32).to(self.device)
-        self.next_legal_masks = torch.zeros((capacity, n_actions), dtype=torch.bool).to(self.device)
+        self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32).to(self.storage_device)
+        self.actions = torch.zeros((capacity, 1), dtype=torch.int64).to(self.storage_device)
+        self.rewards = torch.zeros((capacity, 1), dtype=torch.float32).to(self.storage_device)
+        self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32).to(self.storage_device)
+        self.dones = torch.zeros((capacity, 1), dtype=torch.float32).to(self.storage_device)
+        self.next_legal_masks = torch.zeros((capacity, n_actions), dtype=torch.bool).to(self.storage_device)
 
 
     def add(self, s, a, r, s2, done, next_legal_mask):
         i = self.ptr
-        self.obs[i] = torch.as_tensor(s).to(self.device)
+        self.obs[i] = torch.as_tensor(s).to(self.storage_device)
         self.actions[i] = int(a)
         self.rewards[i] = float(r)
-        self.next_obs[i] = torch.as_tensor(s2).to(self.device)
+        self.next_obs[i] = torch.as_tensor(s2).to(self.storage_device)
         self.dones[i] = float(done)
-        self.next_legal_masks[i] = torch.as_tensor(next_legal_mask).to(self.device)
+        self.next_legal_masks[i] = torch.as_tensor(next_legal_mask).to(self.storage_device)
 
 
         self.ptr = (self.ptr + 1) % self.capacity
@@ -152,7 +155,7 @@ class ReplayBuffer:
 
     def sample(self, batch: int):
         n = self.capacity if self.full else self.ptr
-        idx = torch.randint(0, n, (batch,), device=self.device)
+        idx = torch.randint(0, n, (batch,), device=self.storage_device)
         return (
         self.obs[idx].to(self.device),
         self.actions[idx].to(self.device),
@@ -194,6 +197,7 @@ def evaluate_policy(env, Q, n_episodes: int = 10):
                 q_values[illegal] = -1e9
                 a = int(torch.argmax(q_values).item())
             s2, r, done, info = env.step(a)
+            s = s2
             ep_return += r
         returns.append(ep_return)
     return np.mean(returns)
@@ -211,16 +215,19 @@ def save_checkpoint(model, filepath: str, info: dict = None):
 def dqn_train(
     env: FeatureSelectionEnv,
     cfg: FSConfig,
-    max_total_steps: Optional[int] = None,
+    max_total_steps: int = 1_000_000,
     seed: int = 0,
+    other_checkpoint_info: str = None,
 ):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     
     current_time = time.strftime("%Y%m%d-%H%M%S")
-    checkpoint_dir = f"./checkpoints/{current_time}"
+    checkpoint_dir = f"./checkpoints/{current_time}" + (f"_{other_checkpoint_info}" if other_checkpoint_info else "")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    with open(os.path.join(checkpoint_dir, "fs_config.json"), "w") as f:
+        json.dump(asdict(cfg), f, indent=4)
 
     obs_dim = env.n_feat + 1
     n_actions = env.n_actions
@@ -240,12 +247,14 @@ def dqn_train(
 
     # epsilon schedule
     def epsilon_by_step(step):
-        frac = math.exp(-step / max(1, cfg.eps_decay))
+        frac = max(0, 1 - step / max(1, cfg.eps_decay))
         return cfg.eps_end + (cfg.eps_start - cfg.eps_end) * frac
 
 
     global_step = 0
-
+    latest_evaluated_return = 0
+    best_evaluated_return = -float("inf")
+    evaluated_returns = []
     ep = 0
     print("Starting DQN training...")
     while True:
@@ -256,6 +265,7 @@ def dqn_train(
 
 
         while not done:
+            # print("global_step:", global_step, "episode:", ep)
             eps = epsilon_by_step(global_step)
             legal_mask = env.legal_actions_mask() # bool [n_actions]
 
@@ -317,13 +327,25 @@ def dqn_train(
                             p_tgt.mul_(1.0 - cfg.target_tau).add_(cfg.target_tau * p)
         if (ep % cfg.evaluate_freq) == 0:
             evaluated_return = evaluate_policy(env, q, n_episodes=10)
+            latest_evaluated_return = evaluated_return
+            evaluated_returns.append((global_step, evaluated_return))
+            if evaluated_return > best_evaluated_return:
+                best_evaluated_return = evaluated_return
+                filepath = os.path.join(checkpoint_dir, f"dqn_best_model_ep{ep}_step{global_step}.pth")
+                save_checkpoint(
+                    {"q": q, "q_target": q_tgt},
+                    filepath=filepath,
+                    info={"global_step": global_step, "episode": ep, "eval_return": latest_evaluated_return},
+                )
             print(f"Episode {ep} | eval_return={evaluated_return:.4f}")
-        if (ep % cfg.checkpoint_save_freq) == 0:
+            np.save(os.path.join(checkpoint_dir, "evaluated_returns.npy"), np.array(evaluated_returns))
+            
+        if (ep % cfg.checkpoint_save_freq) == 0 or (global_step >= max_total_steps):
             filepath = os.path.join(checkpoint_dir, f"dqn_checkpoint_ep{ep}_step{global_step}.pth")
             save_checkpoint(
                 {"q": q, "q_target": q_tgt},
                 filepath=filepath,
-                info={"global_step": global_step, "episode": ep},
+                info={"global_step": global_step, "episode": ep, "eval_return": latest_evaluated_return},
             )
         if max_total_steps and global_step >= max_total_steps:
             break
